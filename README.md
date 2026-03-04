@@ -10,14 +10,18 @@ curl -fsSL https://raw.githubusercontent.com/himanishpuri/ct/main/install.sh | b
 
 ## usage
 
+```
 ct [--verbose] <instruction>
 ct --version
 ct --upgrade
 ct --help
+```
 
 ## example
 
+```bash
 ct get all the git branches
+```
 
 ## configuration
 
