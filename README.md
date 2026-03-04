@@ -2,6 +2,12 @@
 
 ct is a command-line utility that converts natural language instructions into shell commands using various AI providers.
 
+## install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/himanishpuri/ct/main/install.sh | bash
+```
+
 ## usage
 
 ct [--verbose] <instruction>
