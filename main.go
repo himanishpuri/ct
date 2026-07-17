@@ -21,6 +21,7 @@ type Config struct {
 	AnthropicModel string
 	GeminiModel    string
 	GroqModel      string
+	SFGatewayModel string
 }
 
 func configDir() string {
@@ -56,6 +57,9 @@ func loadConfig() Config {
 		if kv, ok := strings.CutPrefix(line, "GROQ_MODEL="); ok {
 			cfg.GroqModel = strings.Trim(kv, `"`)
 		}
+		if kv, ok := strings.CutPrefix(line, "SF_LLM_GATEWAY_MODEL="); ok {
+			cfg.SFGatewayModel = strings.Trim(kv, `"`)
+		}
 	}
 	return cfg
 }
@@ -87,8 +91,8 @@ Options:
 
 Description:
   ct converts natural language instructions into shell commands.
-  It supports OPENAI, ANTHROPIC, GEMINI, GROQ, and OLLAMA API providers.
-  Set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, or OLLAMA_MODEL`)
+  It supports SF_LLM_GATEWAY, OPENAI, ANTHROPIC, GEMINI, GROQ, and OLLAMA API providers.
+  Set one of: SF_LLM_GATEWAY_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, or OLLAMA_MODEL`)
 }
 
 func printVersion() {
@@ -231,7 +235,7 @@ func jsonString(data []byte, keys ...string) string {
 
 // OPENAI
 
-func callOpenAI(apiKey, model, prompt string, debug bool) (string, error) {
+func callOpenAI(apiKey, baseURL, model, prompt string, debug bool) (string, error) {
 	type message struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -245,7 +249,7 @@ func callOpenAI(apiKey, model, prompt string, debug bool) (string, error) {
 	headers := map[string]string{
 		"Authorization": "Bearer " + apiKey,
 	}
-	data, err := postJSON("https://api.openai.com/v1/chat/completions", headers, payload, debug)
+	data, err := postJSON(baseURL, headers, payload, debug)
 	if err != nil {
 		return "", err
 	}
@@ -285,7 +289,7 @@ func runOpenAI(apiKey, configuredModel string, cfg Config, debug bool, prompt st
 		if debug {
 			fmt.Fprintf(os.Stderr, "debug: trying OPENAI model: %s\n", model)
 		}
-		cmd, err := callOpenAI(apiKey, model, prompt, debug)
+		cmd, err := callOpenAI(apiKey, "https://api.openai.com/v1/chat/completions", model, prompt, debug)
 		if err != nil {
 			return "", "", err
 		}
@@ -301,6 +305,43 @@ func runOpenAI(apiKey, configuredModel string, cfg Config, debug bool, prompt st
 		}
 	}
 	return "", "", fmt.Errorf("no working OPENAI model found")
+}
+
+// SF LLM GATEWAY EXPRESS (OpenAI-compatible)
+
+const sfGatewayURL = "https://eng-ai-model-gateway.sfproxy.devx-preprod.aws-esvc1-useast2.aws.sfdc.cl/chat/completions"
+
+func runSFGateway(apiKey, configuredModel string, cfg Config, debug bool, prompt string) (string, string, error) {
+	models := dedup([]string{
+		configuredModel,
+		cfg.SFGatewayModel,
+		"claude-sonnet-4-5-20250929",
+		"claude-sonnet-4-20250514",
+		"claude-3-7-sonnet-20250219",
+	})
+	for _, model := range models {
+		if model == "" {
+			continue
+		}
+		if debug {
+			fmt.Fprintf(os.Stderr, "debug: trying SF_LLM_GATEWAY model: %s\n", model)
+		}
+		cmd, err := callOpenAI(apiKey, sfGatewayURL, model, prompt, debug)
+		if err != nil {
+			return "", "", err
+		}
+		if cmd != "" {
+			if debug {
+				fmt.Fprintf(os.Stderr, "debug: saved working model: %s\n", model)
+				fmt.Fprintf(os.Stderr, "debug: extracted command: %s\n", cmd)
+			}
+			return cmd, model, nil
+		}
+		if debug {
+			fmt.Fprintf(os.Stderr, "debug: model %s not available, trying next...\n", model)
+		}
+	}
+	return "", "", fmt.Errorf("no working SF_LLM_GATEWAY model found")
 }
 
 // ANTHROPIC
@@ -642,6 +683,7 @@ func main() {
 	}
 	cfg := loadConfig()
 
+	sfKey := os.Getenv("SF_LLM_GATEWAY_KEY")
 	openaiKey := os.Getenv("OPENAI_API_KEY")
 	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
 	geminiKey := os.Getenv("GEMINI_API_KEY")
@@ -651,6 +693,8 @@ func main() {
 
 	provider := ""
 	switch {
+	case sfKey != "":
+		provider = "sfgateway"
 	case openaiKey != "":
 		provider = "openai"
 	case anthropicKey != "":
@@ -662,7 +706,7 @@ func main() {
 	case ollamaModel != "":
 		provider = "ollama"
 	default:
-		fmt.Fprintln(os.Stderr, "error: no api key found. set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, OLLAMA_MODEL")
+		fmt.Fprintln(os.Stderr, "error: no api key found. set one of: SF_LLM_GATEWAY_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, OLLAMA_MODEL")
 		os.Exit(1)
 	}
 
@@ -695,6 +739,12 @@ func main() {
 	if cfg.GroqModel == "" {
 		cfg.GroqModel = "llama-3.3-70b-versatile"
 	}
+	if v := os.Getenv("SF_LLM_GATEWAY_MODEL"); v != "" {
+		cfg.SFGatewayModel = v
+	}
+	if cfg.SFGatewayModel == "" {
+		cfg.SFGatewayModel = "claude-sonnet-4-5-20250929"
+	}
 
 	prompt := buildPrompt(instruction)
 
@@ -705,6 +755,12 @@ func main() {
 	)
 
 	switch provider {
+	case "sfgateway":
+		command, workingModel, err = runSFGateway(sfKey, cfg.SFGatewayModel, cfg, debug, prompt)
+		if err == nil && workingModel != "" {
+			saveConfig("SF_LLM_GATEWAY_MODEL", workingModel)
+		}
+
 	case "openai":
 		command, workingModel, err = runOpenAI(openaiKey, cfg.OpenAIModel, cfg, debug, prompt)
 		if err == nil && workingModel != "" {
