@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,9 @@ import (
 	"runtime"
 	"strings"
 )
+
+//go:embed VERSION
+var versionString string
 
 // config
 
@@ -92,15 +96,7 @@ Description:
 }
 
 func printVersion() {
-	exe, err := os.Executable()
-	if err == nil {
-		versionFile := filepath.Join(filepath.Dir(exe), "VERSION")
-		if data, err := os.ReadFile(versionFile); err == nil {
-			fmt.Print(string(data))
-			return
-		}
-	}
-	fmt.Println("version file not found")
+	fmt.Println(strings.TrimSpace(versionString))
 }
 
 func runUpgrade() {
@@ -211,6 +207,24 @@ func hasErrorKey(data []byte) bool {
 	return ok
 }
 
+// modelUnavailable reports whether an API error response means the requested
+// model is missing, decommissioned, or otherwise unusable — the signal to fall
+// through to the next model in the list instead of aborting.
+func modelUnavailable(data []byte) bool {
+	s := strings.ToLower(string(data))
+	markers := []string{
+		"model_not_found", "model_decommissioned", "not_found_error",
+		"does not exist", "decommissioned", "no longer supported",
+		"not found for api", "has been removed", "is not found",
+	}
+	for _, m := range markers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
 func jsonString(data []byte, keys ...string) string {
 	var m any
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -237,10 +251,9 @@ func callOpenAI(apiKey, model, prompt string, debug bool) (string, error) {
 		Content string `json:"content"`
 	}
 	payload := map[string]any{
-		"model":       model,
-		"messages":    []message{{Role: "user", Content: prompt}},
-		"temperature": 0.1,
-		"max_tokens":  500,
+		"model":                 model,
+		"messages":              []message{{Role: "user", Content: prompt}},
+		"max_completion_tokens": 2000,
 	}
 	headers := map[string]string{
 		"Authorization": "Bearer " + apiKey,
@@ -253,8 +266,7 @@ func callOpenAI(apiKey, model, prompt string, debug bool) (string, error) {
 		fmt.Fprintf(os.Stderr, "debug: full response: %s\n", data)
 	}
 	if hasErrorKey(data) {
-		code := jsonString(data, "error", "code")
-		if code == "model_not_found" || strings.Contains(string(data), "does not exist") {
+		if modelUnavailable(data) {
 			return "", nil // signal: try next model
 		}
 		msg := jsonString(data, "error", "message")
@@ -277,7 +289,7 @@ func callOpenAI(apiKey, model, prompt string, debug bool) (string, error) {
 }
 
 func runOpenAI(apiKey, configuredModel string, cfg Config, debug bool, prompt string) (string, string, error) {
-	models := dedup([]string{configuredModel, cfg.OpenAIModel, "gpt-4o-mini", "gpt-3.5-turbo"})
+	models := dedup([]string{configuredModel, cfg.OpenAIModel, "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6"})
 	for _, model := range models {
 		if model == "" {
 			continue
@@ -327,8 +339,7 @@ func callAnthropic(apiKey, model, prompt string, debug bool) (string, error) {
 		fmt.Fprintf(os.Stderr, "debug: full response: %s\n", data)
 	}
 	if hasErrorKey(data) {
-		errType := jsonString(data, "error", "type")
-		if errType == "invalid_request_error" && strings.Contains(string(data), "model") {
+		if modelUnavailable(data) {
 			return "", nil // signal: try next model
 		}
 		msg := jsonString(data, "error", "message")
@@ -349,7 +360,7 @@ func callAnthropic(apiKey, model, prompt string, debug bool) (string, error) {
 }
 
 func runAnthropic(apiKey, configuredModel string, cfg Config, debug bool, prompt string) (string, string, error) {
-	models := dedup([]string{configuredModel, cfg.AnthropicModel, "claude-3-5-haiku-20241022", "claude-3-haiku-20240307"})
+	models := dedup([]string{configuredModel, cfg.AnthropicModel, "claude-sonnet-5", "claude-haiku-4-5", "claude-3-5-haiku-latest"})
 	for _, model := range models {
 		if model == "" {
 			continue
@@ -384,7 +395,7 @@ func callGemini(apiKey, model, prompt string, debug bool) (string, error) {
 		},
 		"generationConfig": map[string]any{
 			"temperature":     0.1,
-			"maxOutputTokens": 500,
+			"maxOutputTokens": 2048,
 		},
 	}
 	url := fmt.Sprintf(
@@ -399,8 +410,7 @@ func callGemini(apiKey, model, prompt string, debug bool) (string, error) {
 		fmt.Fprintf(os.Stderr, "debug: full response: %s\n", data)
 	}
 	if hasErrorKey(data) {
-		code := jsonString(data, "error", "code")
-		if code == "404" || strings.Contains(string(data), "not found") {
+		if modelUnavailable(data) {
 			return "", nil // signal: try next model
 		}
 		msg := jsonString(data, "error", "message")
@@ -427,7 +437,7 @@ func callGemini(apiKey, model, prompt string, debug bool) (string, error) {
 }
 
 func runGemini(apiKey, configuredModel string, cfg Config, debug bool, prompt string) (string, string, error) {
-	models := dedup([]string{configuredModel, cfg.GeminiModel, "gemini-2.5-flash-exp", "gemini-1.5-flash", "gemini-pro"})
+	models := dedup([]string{configuredModel, cfg.GeminiModel, "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"})
 	for _, model := range models {
 		if model == "" {
 			continue
@@ -464,7 +474,7 @@ func callGroq(apiKey, model, prompt string, debug bool) (string, error) {
 		"model":       model,
 		"messages":    []message{{Role: "user", Content: prompt}},
 		"temperature": 0.1,
-		"max_tokens":  500,
+		"max_tokens":  2000,
 	}
 	headers := map[string]string{
 		"Authorization": "Bearer " + apiKey,
@@ -477,8 +487,7 @@ func callGroq(apiKey, model, prompt string, debug bool) (string, error) {
 		fmt.Fprintf(os.Stderr, "debug: full response: %s\n", data)
 	}
 	if hasErrorKey(data) {
-		code := jsonString(data, "error", "code")
-		if code == "model_not_found" || strings.Contains(string(data), "does not exist") {
+		if modelUnavailable(data) {
 			return "", nil // signal: try next model
 		}
 		msg := jsonString(data, "error", "message")
@@ -501,7 +510,7 @@ func callGroq(apiKey, model, prompt string, debug bool) (string, error) {
 }
 
 func runGroq(apiKey, configuredModel string, cfg Config, debug bool, prompt string) (string, string, error) {
-	models := dedup([]string{configuredModel, cfg.GroqModel, "llama-3.3-70b-versatile", "llama3-8b-8192", "mixtral-8x7b-32768"})
+	models := dedup([]string{configuredModel, cfg.GroqModel, "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b", "openai/gpt-oss-120b"})
 	for _, model := range models {
 		if model == "" {
 			continue
@@ -675,19 +684,19 @@ func main() {
 		cfg.OpenAIModel = v
 	}
 	if cfg.OpenAIModel == "" {
-		cfg.OpenAIModel = "gpt-4o-mini"
+		cfg.OpenAIModel = "gpt-5.5"
 	}
 	if v := os.Getenv("ANTHROPIC_MODEL"); v != "" {
 		cfg.AnthropicModel = v
 	}
 	if cfg.AnthropicModel == "" {
-		cfg.AnthropicModel = "claude-3-5-haiku-20241022"
+		cfg.AnthropicModel = "claude-sonnet-5"
 	}
 	if v := os.Getenv("GEMINI_MODEL"); v != "" {
 		cfg.GeminiModel = v
 	}
 	if cfg.GeminiModel == "" {
-		cfg.GeminiModel = "gemini-2.0-flash-exp"
+		cfg.GeminiModel = "gemini-flash-latest"
 	}
 	if v := os.Getenv("GROQ_MODEL"); v != "" {
 		cfg.GroqModel = v
